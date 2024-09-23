@@ -1,0 +1,111 @@
+##### univariate JM version 1 ujv1_b4　
+library(simsurv)
+library(mvtnorm)
+library(rstan)
+
+####################
+task_id_string <- Sys.getenv("SLURM_ARRAY_TASK_ID")
+task_id <- as.numeric(task_id_string)
+
+set.seed(task_id)
+
+input_file <- paste0("data_", task_id, ".RData")
+load(input_file)
+####################
+
+
+#####################
+
+cr_id<-data_mstate$id[which(data_mstate$transition==8)]
+data_cr<-data_mstate[sort(which(data_mstate$transition==8)),]
+
+data_UJ<-data_cr
+
+
+#
+L_data<-data.frame(ID=ID,long.data=longit.out,visits=visits.out)
+L_data_cr<-L_data[L_data$ID %in% cr_id,]
+L_data_cr$Tstart<- rep(unique(data_UJ$Tstart),as.vector(table(L_data_cr$ID)))
+L_data_cr$Tstop<- rep(unique(data_UJ$Tstop),as.vector(table(L_data_cr$ID)))
+L_data_split.by.id <- split(L_data_cr, L_data_cr$ID)
+
+cr_extract <- function (x) {
+  if (any(x$visits >= x$Tstart & x$visits < x$Tstop)) {
+    x_new <- x[(x$visits >= x$Tstart) & (x$visits < x$Tstop), ]
+  } else {
+    x_new <- x[x$visits < x$Tstop, ]
+  }
+}
+
+L_data_split.by.id <- lapply(L_data_split.by.id, cr_extract)
+data_lg <- do.call(rbind, L_data_split.by.id)
+
+cr_id2<-unique(data_lg$ID) # excluding subjects in data_UJ that have no longitudinal measurements in cr block
+data_UJ<-data_UJ[data_UJ$id %in% cr_id2,]
+
+# relabel
+data_lg$ID<-rep(1:length(cr_id2),as.vector(table(data_lg$ID)))
+data_UJ$id<-rep(1:length(cr_id2),each=1)
+data_UJ$transition<-as.numeric(data_UJ$transition)
+data_UJ$transition<-replace(data_UJ$transition,data_UJ$transition==c(8),c(1))
+
+# check
+table(data_lg$ID)
+
+
+
+############################################
+# Required quantities for model fitting
+
+y <- data_lg$long.data          # longitudinal outcomes
+ID <- data_lg$ID                # patient IDs
+visits <- data_lg$visits
+N <- length(y)                     # total number of longitudinal outcomes
+n<-length(cr_id2) # total number of subjects involved in the competing risk block
+
+library(statmod)
+glq <- gauss.quad(15, kind = "legendre")
+xk <- glq$nodes   # nodes
+wk <- glq$weights # weights
+
+Nevents<-sum(data_UJ$status==1)
+Qn<-length(data_UJ$status)*15
+nrow_q<-Nevents+Qn
+ID_q<-c(data_UJ$id[which(data_UJ$status==1)],rep(data_UJ$id,each=15))
+
+t_start_q<-c(data_UJ$Tstart[which(data_UJ$status==1)],rep(data_UJ$Tstart,each=15)) # time at entry initial state in B_v
+
+
+t_event_q<-vector()
+t_event_q[1:Nevents]<-data_UJ$years[which(data_UJ$status==1)]
+for (i in 1:length(data_UJ$status)) {
+  t_event_q<-c(t_event_q,data_UJ$years[i]*(1+xk)/2)
+}
+
+t_cf_event_q<-t_event_q+t_start_q
+
+qwts<-vector()
+for (i in 1:length(data_UJ$status)) {
+  qwts<-c(qwts,data_UJ$years[i]*wk/2)
+}
+
+covdat_cr<-covdat[cr_id2,]
+
+nchain<-1
+fitLN1 <- stan(file = "stan_JM_UJ.stan", 
+               data = list(y=y,N=N,n=n,ID=ID,visits=visits,Nevents=Nevents,Qn=Qn,nrow_q=nrow_q,ID_q=ID_q,t_event_q=t_event_q,t_cf_event_q=t_cf_event_q,qwts=qwts,X=as.matrix(covdat_cr)),        
+               warmup = 500,                 
+               iter = 1500,
+               chains = nchain,
+               seed = 2022,
+               init = 0,
+               cores = 1)
+
+mean <- c(task_id, summary(fitLN1, pars = c("gamma", "beta_tilde","Var_e","alpha","delta","lambda"), probs = c(0.025, 0.975))$summary[, c("mean")],sum(unname(get_elapsed_time(fitLN1))))
+sd <- c(task_id,summary(fitLN1, pars = c("gamma", "beta_tilde","Var_e","alpha","delta","lambda"), probs = c(0.025, 0.975))$summary[, c("sd")],sum(unname(get_elapsed_time(fitLN1))))
+p95_L <- c(task_id,summary(fitLN1, pars = c("gamma", "beta_tilde","Var_e","alpha","delta","lambda"), probs = c(0.025, 0.975))$summary[, c("2.5%")],sum(unname(get_elapsed_time(fitLN1))))
+p95_U <- c(task_id,summary(fitLN1, pars = c("gamma", "beta_tilde","Var_e","alpha","delta","lambda"), probs = c(0.025, 0.975))$summary[, c("97.5%")],sum(unname(get_elapsed_time(fitLN1))))
+neff <- c(task_id,summary(fitLN1, pars = c("gamma", "beta_tilde","Var_e","alpha","delta","lambda"), probs = c(0.025, 0.975))$summary[, c("n_eff")],sum(unname(get_elapsed_time(fitLN1))))
+Rhat <- c(task_id,summary(fitLN1, pars = c("gamma", "beta_tilde","Var_e","alpha","delta","lambda"), probs = c(0.025, 0.975))$summary[, c("Rhat")],sum(unname(get_elapsed_time(fitLN1))))
+x <- list(mean=mean, sd=sd, p95_L=p95_L, p95_U=p95_U, neff=neff, Rhat=Rhat)
+save(x, file=paste0("ujv1_8_",task_id,".rdata"))
